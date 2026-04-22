@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import ssl
 import sys
@@ -71,6 +72,21 @@ class BasisRow:
     quote_time: str
 
 
+@dataclass(frozen=True)
+class HistoryRow:
+    trade_date: str
+    futures_symbol: str
+    expiry_date: str | None
+    days_to_expiry: int | None
+    futures_price: float
+    spot_price: float
+    basis_points: float
+    basis_rate_pct: float
+    annualized_basis_pct: float | None
+    open_interest: float | None
+    carry_hint: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="粗看沪深300现货与 IF 合约的升贴水、基差和年化基差。",
@@ -90,6 +106,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--date",
         help="指定观察日期 YYYY-MM-DD；默认取今天，仅影响合约月份和剩余到期天数推导。",
+    )
+    parser.add_argument(
+        "--history-from",
+        help="按日回看时的起始日期 YYYY-MM-DD；与 --history-to 组合使用。",
+    )
+    parser.add_argument(
+        "--history-to",
+        help="按日回看时的结束日期 YYYY-MM-DD；未指定时默认为今天。",
+    )
+    parser.add_argument(
+        "--history-symbol",
+        default="IF0",
+        help="按日回看使用的 IF 日线序列；默认 IF0 表示主力连续，也可指定 IF2606 这类具体合约。",
     )
     parser.add_argument(
         "--timeout",
@@ -113,6 +142,30 @@ def parse_observation_date(raw_value: str | None) -> date:
     if raw_value:
         return datetime.strptime(raw_value, "%Y-%m-%d").date()
     return date.today()
+
+
+def history_mode_enabled(args: argparse.Namespace) -> bool:
+    return bool(args.history_from or args.history_to)
+
+
+def normalize_history_range(args: argparse.Namespace, observation_date: date) -> tuple[date, date]:
+    start_date = (
+        datetime.strptime(args.history_from, "%Y-%m-%d").date()
+        if args.history_from
+        else (
+            datetime.strptime(args.history_to, "%Y-%m-%d").date()
+            if args.history_to
+            else observation_date
+        )
+    )
+    end_date = (
+        datetime.strptime(args.history_to, "%Y-%m-%d").date()
+        if args.history_to
+        else observation_date
+    )
+    if start_date > end_date:
+        raise ValueError("--history-from 不能晚于 --history-to")
+    return start_date, end_date
 
 
 def add_months(value: date, months: int) -> date:
@@ -148,6 +201,36 @@ def listed_contract_months(observation_date: date) -> list[date]:
 
 def contract_symbol(month_date: date) -> str:
     return f"nf_IF{month_date:%y%m}"
+
+
+def disable_env_proxy() -> None:
+    for key in (
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ):
+        os.environ.pop(key, None)
+
+    try:
+        import requests
+    except ImportError:
+        return
+
+    if getattr(requests.sessions.Session, "_csi300_basis_proxy_patched", False):
+        return
+
+    original_init = requests.sessions.Session.__init__
+
+    def patched_init(self: object, *args: object, **kwargs: object) -> None:
+        original_init(self, *args, **kwargs)
+        self.trust_env = False  # type: ignore[attr-defined]
+        self.proxies = {}  # type: ignore[attr-defined]
+
+    requests.sessions.Session.__init__ = patched_init
+    requests.sessions.Session._csi300_basis_proxy_patched = True
 
 
 def fetch_raw_quotes(symbols: list[str], timeout: int, insecure: bool) -> tuple[dict[str, str], bool]:
@@ -242,6 +325,81 @@ def parse_future_quote(symbol: str, raw_value: str, observation_date: date) -> F
         expiry_date=expiry.isoformat(),
         days_to_expiry=(expiry - observation_date).days,
     )
+
+
+def load_akshare() -> object:
+    disable_env_proxy()
+    try:
+        import akshare as ak  # type: ignore
+    except ImportError as exc:
+        raise SystemExit("缺少依赖 akshare，历史模式无法运行。") from exc
+    return ak
+
+
+def history_contract_expiry(symbol: str) -> date | None:
+    match = re.fullmatch(r"IF(\d{4})", symbol.upper())
+    if not match:
+        return None
+    contract_month = datetime.strptime(match.group(1), "%y%m").date().replace(day=1)
+    return third_friday(contract_month.year, contract_month.month)
+
+
+def fetch_history_rows(start_date: date, end_date: date, history_symbol: str) -> list[HistoryRow]:
+    ak = load_akshare()
+    normalized_symbol = history_symbol.upper()
+
+    spot_frame = ak.stock_zh_index_daily(symbol=SPOT_SYMBOL)
+    future_frame = ak.futures_zh_daily_sina(symbol=normalized_symbol)
+
+    spot_records: dict[date, float] = {}
+    for record in spot_frame.to_dict("records"):
+        trade_date = datetime.strptime(str(record["date"]), "%Y-%m-%d").date()
+        if start_date <= trade_date <= end_date:
+            spot_records[trade_date] = parse_float(str(record["close"]))
+
+    future_records: dict[date, dict[str, float]] = {}
+    for record in future_frame.to_dict("records"):
+        trade_date = datetime.strptime(str(record["date"]), "%Y-%m-%d").date()
+        if start_date <= trade_date <= end_date:
+            future_records[trade_date] = {
+                "close": parse_float(str(record["close"])),
+                "hold": parse_float(str(record.get("hold", 0.0))),
+            }
+
+    expiry_date = history_contract_expiry(normalized_symbol)
+    common_dates = sorted(set(spot_records).intersection(future_records))
+    if not common_dates:
+        raise ValueError(
+            f"未取到 {normalized_symbol} 在 {start_date.isoformat()} 到 {end_date.isoformat()} 的逐日交集数据"
+        )
+
+    rows: list[HistoryRow] = []
+    for trade_date in common_dates:
+        spot_close = spot_records[trade_date]
+        future_close = future_records[trade_date]["close"]
+        basis_points = future_close - spot_close
+        basis_rate_pct = (basis_points / spot_close) * 100 if spot_close else 0.0
+        days_to_expiry = (expiry_date - trade_date).days if expiry_date else None
+        annualized_basis_pct = None
+        if expiry_date and days_to_expiry and days_to_expiry > 0 and spot_close:
+            annualized_basis_pct = basis_rate_pct * 365 / days_to_expiry
+
+        rows.append(
+            HistoryRow(
+                trade_date=trade_date.isoformat(),
+                futures_symbol=normalized_symbol,
+                expiry_date=expiry_date.isoformat() if expiry_date else None,
+                days_to_expiry=days_to_expiry,
+                futures_price=future_close,
+                spot_price=spot_close,
+                basis_points=basis_points,
+                basis_rate_pct=basis_rate_pct,
+                annualized_basis_pct=annualized_basis_pct,
+                open_interest=future_records[trade_date]["hold"] if future_records[trade_date]["hold"] else None,
+                carry_hint=carry_hint(basis_points),
+            )
+        )
+    return rows
 
 
 def choose_main_contract(quotes: list[FutureQuote]) -> str | None:
@@ -359,6 +517,94 @@ def render_json(spot: SpotQuote, rows: list[BasisRow], used_insecure: bool, obse
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def render_history_markdown(
+    rows: list[HistoryRow],
+    start_date: date,
+    end_date: date,
+    history_symbol: str,
+) -> str:
+    lines = [
+        "# 沪深300 IF 逐日基差历史",
+        "",
+        f"- 区间：{start_date.isoformat()} -> {end_date.isoformat()}",
+        f"- 期货序列：{history_symbol.upper()}",
+        "- 口径：按日收盘对收盘；基差 = 期货 - 现货；贴水对多现货/空 IF 偏负 carry",
+    ]
+    if history_contract_expiry(history_symbol) is None:
+        lines.append("- 说明：当前序列无固定到期日，年化基差率不展示")
+    lines.extend(
+        [
+            "",
+            "| 日期 | 序列 | 到期日 | 剩余天数 | 期货收盘 | 现货收盘 | 基差点数 | 基差率 | 年化基差率 | 持仓量 | 提示 |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    for row in rows:
+        annualized = f"{row.annualized_basis_pct:.2f}%" if row.annualized_basis_pct is not None else "-"
+        expiry = row.expiry_date or "-"
+        days = str(row.days_to_expiry) if row.days_to_expiry is not None else "-"
+        hold = f"{row.open_interest:.0f}" if row.open_interest is not None else "-"
+        lines.append(
+            "| {trade_date} | {symbol} | {expiry} | {days} | {future:.4f} | {spot:.4f} | {basis:.4f} | {rate:.2f}% | {annualized} | {hold} | {hint} |".format(
+                trade_date=row.trade_date,
+                symbol=row.futures_symbol,
+                expiry=expiry,
+                days=days,
+                future=row.futures_price,
+                spot=row.spot_price,
+                basis=row.basis_points,
+                rate=row.basis_rate_pct,
+                annualized=annualized,
+                hold=hold,
+                hint=row.carry_hint,
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_history_text(
+    rows: list[HistoryRow],
+    start_date: date,
+    end_date: date,
+    history_symbol: str,
+) -> str:
+    lines = [
+        f"区间: {start_date.isoformat()} -> {end_date.isoformat()}",
+        f"期货序列: {history_symbol.upper()}",
+        "口径: 按日收盘对收盘；基差 = 期货 - 现货；贴水对多现货/空 IF 偏负 carry",
+    ]
+    if history_contract_expiry(history_symbol) is None:
+        lines.append("说明: 当前序列无固定到期日，年化基差率不展示")
+    lines.append("")
+    for row in rows:
+        annualized = f"{row.annualized_basis_pct:.2f}%" if row.annualized_basis_pct is not None else "-"
+        expiry = row.expiry_date or "-"
+        days = str(row.days_to_expiry) if row.days_to_expiry is not None else "-"
+        hold = f"{row.open_interest:.0f}" if row.open_interest is not None else "-"
+        lines.append(
+            f"{row.trade_date} {row.futures_symbol} 到期={expiry} 剩余={days}天 "
+            f"期货={row.futures_price:.4f} 现货={row.spot_price:.4f} "
+            f"基差={row.basis_points:.4f} 基差率={row.basis_rate_pct:.2f}% "
+            f"年化={annualized} 持仓={hold} {row.carry_hint}"
+        )
+    return "\n".join(lines)
+
+
+def render_history_json(
+    rows: list[HistoryRow],
+    start_date: date,
+    end_date: date,
+    history_symbol: str,
+) -> str:
+    payload = {
+        "history_from": start_date.isoformat(),
+        "history_to": end_date.isoformat(),
+        "history_symbol": history_symbol.upper(),
+        "rows": [asdict(row) for row in rows],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
 def write_output(content: str, output_path: str | None) -> None:
     if output_path:
         path = Path(output_path)
@@ -369,7 +615,31 @@ def write_output(content: str, output_path: str | None) -> None:
 
 def main() -> int:
     args = parse_args()
+    disable_env_proxy()
     observation_date = parse_observation_date(args.date)
+
+    if history_mode_enabled(args):
+        try:
+            history_start, history_end = normalize_history_range(args, observation_date)
+            history_rows = fetch_history_rows(
+                start_date=history_start,
+                end_date=history_end,
+                history_symbol=args.history_symbol,
+            )
+        except (HTTPError, URLError, ValueError) as exc:
+            sys.stderr.write(f"抓取 IF 历史基差失败: {exc}\n")
+            return 1
+
+        if args.format == "json":
+            content = render_history_json(history_rows, history_start, history_end, args.history_symbol)
+        elif args.format == "text":
+            content = render_history_text(history_rows, history_start, history_end, args.history_symbol)
+        else:
+            content = render_history_markdown(history_rows, history_start, history_end, args.history_symbol)
+
+        write_output(content, args.output)
+        return 0
+
     contract_months = listed_contract_months(observation_date)
     symbols = [SPOT_SYMBOL, *[contract_symbol(month_date) for month_date in contract_months]]
 

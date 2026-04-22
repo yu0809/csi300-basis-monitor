@@ -17,6 +17,8 @@ description: 当用户想每天粗看沪深300中性对冲产品相关的 IF 升
 - 主力合约标记
 - 对 `多现货 / 空 IF` 中性产品的大致含义
 
+如果用户要看历史，则切到逐日模式，按日收盘对收盘输出一整段时间的基差序列。
+
 ## Workflow
 
 1. 默认直接跑脚本，输出 Markdown 表格：
@@ -43,6 +45,23 @@ python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_i
 python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_if_basis.py --insecure
 ```
 
+5. 如果要看一段时间内每天的基差历史，默认使用 `IF0` 主力连续：
+
+```bash
+python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_if_basis.py \
+  --history-from 2026-04-01 \
+  --history-to 2026-04-21
+```
+
+6. 如果要看具体某个合约每天的基差历史，例如 `IF2606`：
+
+```bash
+python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_if_basis.py \
+  --history-from 2026-04-01 \
+  --history-to 2026-04-21 \
+  --history-symbol IF2606
+```
+
 ## Interpretation Rules
 
 - `基差 = 期货 - 现货`
@@ -59,6 +78,8 @@ python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_i
 - 换月执行价格
 - 交易成本、冲击成本、融券与申赎摩擦
 - 分红和股息点位调整
+
+历史模式默认是“日收盘对日收盘”的基差序列，不是盘中逐分钟回放。
 
 ## Contract Logic
 
@@ -99,6 +120,18 @@ python3 /Users/jaysonyu/Desktop/stock_skill/csi300-basis-monitor/scripts/fetch_i
 - 年化基差率
 - 持仓量
 - 对中性产品的 carry 提示
+
+历史模式则输出：
+
+- 日期
+- 期货序列（默认 `IF0`）
+- 期货收盘
+- 沪深300现货收盘
+- 基差点数
+- 基差率
+- 年化基差率（仅固定到期合约）
+- 持仓量
+- carry 提示
 
 如果用户只要一句话总结，先跑脚本，再用结果浓缩成：
 
