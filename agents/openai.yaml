@@ -1,0 +1,7 @@
+interface:
+  display_name: "沪深300对冲基差"
+  short_description: "查看沪深300中性对冲所需的IF升贴水、基差与年化基差"
+  default_prompt: "使用 $csi300-basis-monitor 粗看今天沪深300中性对冲产品对应的 IF 升贴水、主力合约和年化基差。"
+
+policy:
+  allow_implicit_invocation: true
